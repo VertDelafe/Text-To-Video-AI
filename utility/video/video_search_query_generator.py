@@ -33,20 +33,62 @@ def fix_json(json_str):
     json_str = json_str.replace('"you didn"t"', '"you didn\'t"')
     return json_str
 
+def _local_fallback_queries(script, captions_timed, end):
+    """Keyword-extraction fallback used whenever the LLM can't be trusted to
+    produce the exact schema in time. Deterministic, free, and — unlike a
+    dead `return None` — always leaves the pipeline with *something* to
+    search Pexels for.
+    """
+    stop_words = {"the", "a", "an", "and", "or", "but", "is", "are", "was", "were", "of", "to", "in", "on", "at", "for", "with", "as", "by", "it", "its", "we", "us", "our", "you"}
+
+    fallback = []
+    t = 0.0
+    while t < end:
+        t_next = min(t + 4.0, end)
+
+        # Extract words spoken during this segment
+        segment_words = []
+        for (w_t1, w_t2), word in captions_timed:
+            # Check if word overlaps with segment
+            if w_t1 >= t and w_t1 < t_next:
+                clean = re.sub(r'[^\w\s]', '', str(word).lower()).strip()
+                if clean and clean not in stop_words:
+                    segment_words.append(clean)
+
+        # Join up to 4 words to make a visual query
+        query_text = " ".join(segment_words[:4])
+        if not query_text:
+            query_text = "underwater deep ocean" if "ocean" in script.lower() else "stock background video"
+
+        fallback.append([[t, t_next], [query_text, "underwater ocean depth", "marine life abyss"]])
+        t = t_next
+    return fallback
+
+
 def getVideoSearchQueriesTimed(script,captions_timed):
     end = captions_timed[-1][0][1]
     max_retries = 3
     retry_count = 0
-    
+
     try:
         out = [[[0,0],""]]
         while out[-1][0][1] != end:
             if retry_count >= max_retries:
-                print(f"Max retries ({max_retries}) reached. Using current result or fallback.")
+                print(f"Max retries ({max_retries}) reached. Using current result or local fallback.")
                 if out == [[[0,0],""]]:
-                    return None
+                    # Every attempt failed to produce the expected schema
+                    # (observed live with qwen3.5:4b: format:"json" guarantees
+                    # syntactically valid JSON but not schema compliance — it
+                    # returned three different unrelated JSON shapes across
+                    # three retries). This used to `return None` here, which
+                    # skipped the local fallback below entirely (no exception
+                    # was raised, so the except block never ran) and crashed
+                    # generate_video_url() downstream with a bare
+                    # "'NoneType' object is not iterable". Fall through to the
+                    # same deterministic fallback the except handler uses.
+                    return _local_fallback_queries(script, captions_timed, end)
                 return out
-            
+
             content = call_OpenAI(script,captions_timed).replace("'",'"')
             try:
                 out = json.loads(content)
@@ -60,38 +102,14 @@ def getVideoSearchQueriesTimed(script,captions_timed):
                     print(f"Failed to fix JSON: {e2}")
                     retry_count += 1
                     continue
-            
+
             if out[-1][0][1] != end:
                 retry_count += 1
-        
+
         return out
     except Exception as e:
         print("error in response, generating local fallback queries:", e)
-        # Stop words to filter out for cleaner search terms
-        stop_words = {"the", "a", "an", "and", "or", "but", "is", "are", "was", "were", "of", "to", "in", "on", "at", "for", "with", "as", "by", "it", "its", "we", "us", "our", "you"}
-        
-        fallback = []
-        t = 0.0
-        while t < end:
-            t_next = min(t + 4.0, end)
-            
-            # Extract words spoken during this segment
-            segment_words = []
-            for (w_t1, w_t2), word in captions_timed:
-                # Check if word overlaps with segment
-                if w_t1 >= t and w_t1 < t_next:
-                    clean = re.sub(r'[^\w\s]', '', str(word).lower()).strip()
-                    if clean and clean not in stop_words:
-                        segment_words.append(clean)
-            
-            # Join up to 4 words to make a visual query
-            query_text = " ".join(segment_words[:4])
-            if not query_text:
-                query_text = "underwater deep ocean" if "ocean" in script.lower() else "stock background video"
-            
-            fallback.append([[t, t_next], [query_text, "underwater ocean depth", "marine life abyss"]])
-            t = t_next
-        return fallback
+        return _local_fallback_queries(script, captions_timed, end)
 
 def call_OpenAI(script,captions_timed):
     config = get_config()
@@ -116,6 +134,15 @@ Timed Captions:{}
             }
         )
         text = response.text.strip()
+    elif provider == 'ollama':
+        # Same fix as script_generator.py's _call_ollama_native: calling
+        # Ollama's OpenAI-compatible /v1 endpoint left a hybrid-reasoning
+        # model (qwen3.5:4b) stuck in its hidden "thinking" pass for this
+        # prompt in particular — it's much longer than the script prompt
+        # (the full script plus every individual timed caption serialized
+        # inline) — observed hanging for minutes with no output. Calling
+        # Ollama's native /api/chat with think:false fixes it the same way.
+        text = _call_ollama_native(model, prompt, user_content).strip()
     else:
         response = client.chat.completions.create(
             model=model,
@@ -178,6 +205,34 @@ Timed Captions:{}
         print("Using default fallback structure")
         default_json = '[[[0.16, 5.29], ["default background video", "stock footage", "generic scene"]], [[5.29, 10.29], ["stock video", "background footage", "video content"]]]'
         return default_json
+
+def _call_ollama_native(model, system_prompt, user_content):
+    """See utility/script/script_generator.py's _call_ollama_native for why
+    this bypasses the OpenAI-compat /v1 endpoint. Ollama's native `format`
+    field also accepts plain "json" for any-valid-JSON output (not just
+    JSON objects), which is what this caller needs since the expected shape
+    here is a top-level array, not an object."""
+    import os
+    import requests
+
+    base_url = os.getenv('OLLAMA_URL', 'http://127.0.0.1:11434').rstrip('/')
+    response = requests.post(
+        f"{base_url}/api/chat",
+        json={
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            "format": "json",
+            "think": False,
+            "stream": False,
+        },
+        timeout=120,
+    )
+    response.raise_for_status()
+    return response.json()["message"]["content"]
+
 
 def merge_empty_intervals(segments):
     if segments is None:
