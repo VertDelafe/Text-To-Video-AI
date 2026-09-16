@@ -67,6 +67,8 @@ def generate_script(topic):
     
     if provider == 'gemini':
         content = _call_gemini(client, topic, prompt)
+    elif provider == 'ollama':
+        content = _call_ollama_native(model, topic, prompt)
     else:
         content = _call_openai_groq(client, model, topic, prompt)
     
@@ -96,26 +98,57 @@ def generate_script(topic):
 
 
 def _call_openai_groq(client, model, topic, prompt):
-    kwargs = {}
-    if get_config().get_llm_provider() == 'ollama':
-        # Small local models are far less reliable than GPT-4o/Groq-hosted
-        # models at "just follow the instruction and only output JSON" — a
-        # prompt-only approach still occasionally returns plain prose with no
-        # braces at all. Ollama's OpenAI-compatible endpoint honors
-        # response_format the same way llama.cpp's grammar-constrained JSON
-        # mode does, so this makes the output *syntactically* guaranteed to
-        # be JSON regardless of model size, on top of the prompt instruction.
-        kwargs["response_format"] = {"type": "json_object"}
-
     response = client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": prompt},
             {"role": "user", "content": topic}
-        ],
-        **kwargs,
+        ]
     )
     return response.choices[0].message.content
+
+
+def _call_ollama_native(model, topic, prompt):
+    """Calls Ollama's native /api/chat instead of going through the
+    OpenAI-compatible /v1 shim.
+
+    Two things needed to make a small local model produce reliable JSON,
+    both verified live against qwen3.5:4b:
+
+    1. `format: "json"` — grammar-constrained decoding, guarantees
+       syntactically valid JSON. (The OpenAI-compat layer's equivalent,
+       response_format={"type": "json_object"}, did NOT fix this — see 2.)
+    2. `think: False` — qwen3.5 is a hybrid-reasoning model that otherwise
+       spends its whole generation budget on a hidden "thinking" pass and
+       returns an EMPTY final `content` once JSON-grammar mode is also
+       forced. Disabling it dropped a call that previously returned '' down
+       to well under a second with correct output. The OpenAI-compat /v1
+       endpoint does not honor a passthrough `think` field (tested via both
+       the openai SDK's `extra_body` and a raw request to /v1/chat/completions
+       — both left thinking on) — the native endpoint is the only place this
+       flag reliably applies, hence calling it directly here instead of
+       reusing the OpenAI-compatible client from get_llm_client().
+    """
+    import os
+    import requests
+
+    base_url = os.getenv('OLLAMA_URL', 'http://127.0.0.1:11434').rstrip('/')
+    response = requests.post(
+        f"{base_url}/api/chat",
+        json={
+            "model": model,
+            "messages": [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": topic},
+            ],
+            "format": "json",
+            "think": False,
+            "stream": False,
+        },
+        timeout=120,
+    )
+    response.raise_for_status()
+    return response.json()["message"]["content"]
 
 
 def _call_gemini(client, topic, prompt):
