@@ -108,14 +108,42 @@ if __name__ == "__main__":
         print("\n--- STAGE 5: Sourcing Timed B-Roll Videos ---")
         script = manager.get_data("script")
         timed_captions = manager.get_data("timed_captions")
-        search_terms = getVideoSearchQueriesTimed(script, timed_captions)
-        
+
+        # Reference-image mode: if the caller supplied local images (via
+        # REFERENCE_IMAGES_DIR), use those directly instead of searching
+        # Pexels — skips the LLM-driven query step entirely, which is both
+        # more relevant (the user's own photos) and avoids that step's
+        # unreliable JSON-schema matching (see docs/repo-evaluation.md).
+        reference_images_dir = os.getenv("REFERENCE_IMAGES_DIR", "").strip()
+        reference_images = []
+        if reference_images_dir and os.path.isdir(reference_images_dir):
+            image_exts = (".jpg", ".jpeg", ".png", ".webp", ".heic")
+            reference_images = sorted(
+                os.path.join(reference_images_dir, f)
+                for f in os.listdir(reference_images_dir)
+                if f.lower().endswith(image_exts)
+            )
+
+        if reference_images:
+            print(f"Using {len(reference_images)} local reference image(s) instead of Pexels search: "
+                  f"{[os.path.basename(p) for p in reference_images]}")
+            from utility.video.local_image_generator import build_local_image_segments
+            total_duration = timed_captions[-1][0][1] if timed_captions else 10.0
+            background_video_urls = build_local_image_segments(reference_images, total_duration)
+            manager.update_data("background_video_urls", background_video_urls)
+            manager.set_stage("6_render")
+            search_terms = None  # not needed in this branch; keeps the name defined
+        else:
+            search_terms = getVideoSearchQueriesTimed(script, timed_captions)
+
         background_video_urls = manager.get_data("background_video_urls") or []
-        
+
         # Determine model
         model_name = os.getenv("MUAPI_VIDEO_MODEL", "veo3-fast-text-to-video")
 
-        if use_muapi:
+        if reference_images:
+            pass  # already handled and staged above
+        elif use_muapi:
             client = MuapiClient()
             print(f"Generating B-Roll clips using Muapi model '{model_name}'...")
             
