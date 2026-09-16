@@ -56,9 +56,11 @@ def generate_script(topic):
 
         Keep it brief, highly interesting, and unique.
 
-        Stictly output the script in a JSON format like below, and only provide a parsable JSON object with the key 'script'.
+        Reply with ONLY a single parsable JSON object with the key 'script' — no
+        preamble, no markdown fences, no commentary before or after it. Smaller
+        local models are more literal about instructions than large ones, so
+        this must be the entire response, verbatim:
 
-        # Output
         {"script": "Here is the script ..."}
         """
     )
@@ -94,12 +96,24 @@ def generate_script(topic):
 
 
 def _call_openai_groq(client, model, topic, prompt):
+    kwargs = {}
+    if get_config().get_llm_provider() == 'ollama':
+        # Small local models are far less reliable than GPT-4o/Groq-hosted
+        # models at "just follow the instruction and only output JSON" — a
+        # prompt-only approach still occasionally returns plain prose with no
+        # braces at all. Ollama's OpenAI-compatible endpoint honors
+        # response_format the same way llama.cpp's grammar-constrained JSON
+        # mode does, so this makes the output *syntactically* guaranteed to
+        # be JSON regardless of model size, on top of the prompt instruction.
+        kwargs["response_format"] = {"type": "json_object"}
+
     response = client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": prompt},
             {"role": "user", "content": topic}
-        ]
+        ],
+        **kwargs,
     )
     return response.choices[0].message.content
 

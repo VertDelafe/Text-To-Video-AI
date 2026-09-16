@@ -53,11 +53,16 @@ class Config:
         errors = []
         
         llm_provider = os.getenv('LLM_PROVIDER', '').lower()
-        if llm_provider not in ['openai', 'groq', 'gemini']:
+        if llm_provider not in ['openai', 'groq', 'gemini', 'ollama']:
             errors.append(
-                f"Invalid LLM_PROVIDER: '{llm_provider}'. Must be one of: openai, groq, gemini"
+                f"Invalid LLM_PROVIDER: '{llm_provider}'. Must be one of: openai, groq, gemini, ollama"
             )
-        
+
+        if llm_provider == 'ollama':
+            if not os.getenv('OLLAMA_MODEL'):
+                errors.append("Missing required configuration: OLLAMA_MODEL (required for LLM_PROVIDER=ollama)")
+            # No API key needed — local daemon, $0 cost.
+
         if llm_provider == 'openai':
             if not os.getenv('OPENAI_API_KEY'):
                 errors.append("Missing required API key: OPENAI_API_KEY (required for LLM_PROVIDER=openai)")
@@ -109,9 +114,9 @@ class Config:
             error_message += "\nPlease check your .env file and ensure all required keys are set."
             raise ConfigurationError(error_message)
     
-    def get_llm_provider(self) -> Literal['openai', 'groq', 'gemini']:
+    def get_llm_provider(self) -> Literal['openai', 'groq', 'gemini', 'ollama']:
         return os.getenv('LLM_PROVIDER', '').lower()
-    
+
     def get_llm_model(self) -> str:
         provider = self.get_llm_provider()
         if provider == 'openai':
@@ -120,16 +125,24 @@ class Config:
             return os.getenv('GROQ_MODEL', 'llama3-70b-8192')
         elif provider == 'gemini':
             return os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
+        elif provider == 'ollama':
+            return os.getenv('OLLAMA_MODEL', 'qwen3.5:4b')
         raise ConfigurationError(f"Unknown LLM provider: {provider}")
-    
+
     def get_llm_client(self):
         if self._llm_client is not None:
             return self._llm_client
-        
+
         provider = self.get_llm_provider()
-        
+
         if provider == 'openai':
             self._llm_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        elif provider == 'ollama':
+            # Ollama exposes an OpenAI-compatible /v1 endpoint, so the existing
+            # OpenAI/Groq call path (_call_openai_groq) works unmodified.
+            # No key required; api_key is a required-but-unchecked placeholder.
+            base_url = os.getenv('OLLAMA_URL', 'http://127.0.0.1:11434').rstrip('/') + '/v1'
+            self._llm_client = OpenAI(api_key='ollama', base_url=base_url)
         elif provider == 'groq':
             if not GROQ_AVAILABLE:
                 raise ConfigurationError("Groq library not installed. Run: pip install groq")
